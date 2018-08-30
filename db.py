@@ -1,10 +1,18 @@
 
 import pickle
-import gc
+import configparser
 from collections import Counter
 
 import records
 import requests
+
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+karma_conversion = config['db_only']['karma_conversion']
+verbose = config['all files'].getboolean('verbose')
+db_url = config['all files']['db_url']
+db = records.Database(db_url=db_url)
 
 
 def api_query(payload, endpoint, default=None):
@@ -47,7 +55,7 @@ def api_query(payload, endpoint, default=None):
     return result_list_or_dict
 
 
-def init_items(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
+def init_items():
     if verbose:
         print('initialising items table')
 
@@ -65,7 +73,7 @@ def init_items(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
     db.query(query="INSERT INTO ITEMS (id, vendor_cost, karma_cost, vendor_value, bound, tp_cost, tp_value) VALUES (0, 0, 0, 0, 0, 0, 0);")
 
 
-def init_recipes(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
+def init_recipes():
     if verbose:
         print('initialising recipe table')
 
@@ -82,7 +90,7 @@ def init_recipes(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')
     db.query(query=initialise)
 
 
-def init_views(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db'), karma_conversion=51):      # karma conversion is how much  karma is worth 1 coin
+def init_views():      # karma conversion is how much  karma is worth 1 coin
     if verbose:
         print('initialising views')
 
@@ -110,7 +118,7 @@ FROM items
     db.query(query=query)
 
 
-def populate_items(item_id_list=None, verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
+def populate_items(item_id_list=None):
     if item_id_list is None:
         item_id_list = api_query(payload='', endpoint='item_details')
 
@@ -165,7 +173,7 @@ def populate_items(item_id_list=None, verbose=False, db=records.Database(db_url=
     db.query('VACUUM;')
 
 
-def vendor_pricing(vendor_dict=None, verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
+def vendor_pricing(vendor_dict=None):
     # dict must be of the form item_id: vendor price.
     if verbose:
         print('adding vendor pricing')
@@ -229,7 +237,7 @@ def trading_post_pricing(item_list=None, verbose=False, db=records.Database(db_u
     db.query('VACUUM;')
 
 
-def populate_recipe_table(recipe_list=None, verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
+def populate_recipe_table(recipe_list=None):
     if recipe_list is None:
         recipe_list = api_query(payload='', endpoint='recipe_details')
 
@@ -298,7 +306,7 @@ def populate_recipe_table(recipe_list=None, verbose=False, db=records.Database(d
     return missed_recipes
 
 
-def alternate_recipes(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db'), debug=False):
+def alternate_recipes(debug=False):
     from math import gcd
     added_recipes = False
 
@@ -390,7 +398,7 @@ def alternate_recipes(verbose=False, db=records.Database(db_url='sqlite:///./gw2
     return added_recipes
 
 
-def get_price(recipe_id, verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
+def get_price(recipe_id):
     select_string = "SELECT"
     revenue_string = " revenue"
     cost_template = " - {number}"
@@ -484,16 +492,6 @@ def format_prices(price):
     return price_string
 
 
-def update_slots(new_slots, db=records.Database(db_url='sqlite:///./gw2.db')):
-    global slots
-    for number in range(slots, new_slots):
-        formatted_number = str(number).zfill(2)
-        db.query('ALTER TABLE recipes ADD COLUMN item{} INTEGER DEFAULT 0'.format(formatted_number))
-        db.query('ALTER TABLE recipes ADD COLUMN quantity{} INTEGER DEFAULT 0'.format(formatted_number))
-
-    slots = new_slots
-
-
 def generate_unique_id(recipe_id, other_recipe_id=0, size=0):
     from hashlib import blake2b
     key = (other_recipe_id).to_bytes(length=size, byteorder='big')
@@ -504,43 +502,33 @@ def generate_unique_id(recipe_id, other_recipe_id=0, size=0):
     return unique_id
 
 
-def cleanup(verbose=False, db=None):
-    gc.collect()
-    if db:
-        db.query('VACUUM;')
-
-
 if __name__ == '__main__':
     init_items_flag = False
     init_recipes_flag = False
-    verbose = True
-    global slots
-    slots = 4
-    db = records.Database(db_url='sqlite:///./gw2.db')
-
+    
     if init_items_flag:
-        init_items(verbose=verbose, db=db)
-        populate_items(verbose=verbose, db=db)
-        vendor_pricing(verbose=verbose, db=db)
-        trading_post_pricing(verbose=verbose, db=db)
-
-        cleanup(verbose=verbose, db=db)
+        init_items()
+        populate_items()
+        vendor_pricing()
+        trading_post_pricing()
+        
+    db.query("VACUUM()")
 
     if init_recipes_flag:
-        init_recipes(verbose=verbose, db=db)
-        init_views(verbose=verbose, db=db)
-        missed_recipes = populate_recipe_table(verbose=verbose, db=db)
+        init_recipes()
+        init_views)
+        missed_recipes = populate_recipe_table()
         while missed_recipes:
-            missed_recipes = populate_recipe_table(recipe_list=missed_recipes, verbose=verbose, db=db)
+            missed_recipes = populate_recipe_table(recipe_list=missed_recipes)
 
-        cleanup(verbose=verbose, db=db)
+        db.query("VACUUM()")
 
-    added_recipes = alternate_recipes(verbose=verbose, db=db, debug=True)
+    added_recipes = alternate_recipes(debug=True)
     while added_recipes:
-        added_recipes = alternate_recipes(verbose=verbose, db=db, debug=True)
+        added_recipes = alternate_recipes(debug=True)
 
     recipe_list = api_query(payload='', endpoint='recipe_details')
     if verbose:
         print('evaluating profitable recipes')
     for recipe_id in recipe_list:
-        get_price(recipe_id=recipe_id, verbose=verbose, db=db)
+        get_price(recipe_id=recipe_id)
