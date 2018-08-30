@@ -15,6 +15,34 @@ db_url = config['all files']['db_url']
 db = records.Database(db_url=db_url)
 
 
+def component_to_string(item_id, count):
+    component_string = "{ingredient_code}-{count},".format(ingredient_code=int(item_id, 36), count=count)
+    return component_string
+
+
+def string_to_component_dict_list(component_string):
+    component_dict_list = []
+    for component in component_string.split(','):
+        item_id, count = component.split('-')
+        component_dict_list.append({'item_id': item_id, 'count': count})
+        
+    return component_dict_list
+
+
+def dict_list_to_string(recipe_dict_list):
+    ingredients = Counter()
+    for ingredient in recipe_dict_list:
+        item_id = ingredient['item_id']
+        quantity = ingredient['count']
+        ingredients[item_id] += quantity
+
+    component_string = ''
+    for ingredient_id, ingredient_quantity in ingredients.most_common():
+        component_string += component_to_string(item_id=ingredient_id, count=ingredient_quantity)
+        
+    return component_string
+
+
 def api_query(payload, endpoint, default=None):
 
     if endpoint == 'recipes_output':
@@ -279,16 +307,8 @@ def populate_recipe_table(recipe_list=None):
                 needs_recipe = 0
 
             unique_id = generate_unique_id(recipe_id=recipe_id, size=7)
-            
-            ingredients = Counter()
-            for ingredient in recipe_dict.get('ingredients', []):
-                item_id = ingredient['item_id']
-                quantity = ingredient['count']
-                ingredients[item_id] += quantity
 
-            component_string = ''
-            for ingredient_id, ingredient_quantity in ingredients.most_common():
-                component_string += "{ingredient_code}-{count},".format(ingredient_code=int(ingredient_id, 36), count=ingredient_quantity)
+            component_string = dict_list_to_string(dict_list=recipe_dict.get('ingredients', []))
 
             query_string = insert_string.format(
                 id=recipe_id, output_id=output_item_id, output_quantity=output_quantity, unique_id=unique_id,
@@ -314,86 +334,91 @@ def alternate_recipes(debug=False):
 
     for component_recipe_number, component_recipe_dict in enumerate(component_recipe_dict_list):
         component_recipe_unique_id = component_recipe_dict.get('unique_id')
-        component_output_item = component_recipe_dict.get('output_item')
-        component_output_quantity = component_recipe_dict.get('output_quantity')
-        for slot_number in range(slots):
-            product_recipe_dict_list = db.query('SELECT * FROM recipes WHERE item{formatted_number} = {item_id} ORDER BY is_altered ASC, game_id ASC;'.format(formatted_number=str(slot_number).zfill(2), item_id=component_output_item)).as_dict()
-            for product_recipe_number, product_recipe_dict in enumerate(product_recipe_dict_list):
-                if verbose:
-                    print(
-                        '\radding alternate recipes - component recipe {component} of {max_components} - slot {slot} of {max_slot} - product recipe {product} of {max_products}'.format(
-                            slot=slot_number, max_slot=slots,
-                            component=component_recipe_number, max_components=len(component_recipe_dict_list),
-                            product=product_recipe_number, max_products=len(product_recipe_dict_list),
-                        ), end='')
+        component_recipe_output_item = component_recipe_dict.get('output_item')
+        component_recipe_output_quantity = component_recipe_dict.get('output_quantity')
+        component_output_string = component_to_string(item_id=component_output_item, count=component_output_quantity)
+        component_output_search_string = component_to_string(item_id=component_output_item, count=0)[:-2]
+        
+        product_recipe_dict_list = db.query("SELECT * FROM recipes WHERE component_string LIKE '{component_output_search_string}'")
+        for product_recipe_number, product_recipe_dict in enumerate(product_recipe_dict_list):
+            if verbose:
+                print(
+                    '\radding alternate recipes - component recipe {component} of {max_components} - product recipe {product} of {max_products}'.format(
+                        component=component_recipe_number, max_components=len(component_recipe_dict_list),
+                        product=product_recipe_number, max_products=len(product_recipe_dict_list),
+                    ), end='')
 
+            product_recipe_unique_id = product_recipe_dict.get('unique_id')
+            combined_unique_id = generate_unique_id(product_recipe_unique_id, component_recipe_unique_id, size=7)
+            dupecheck = db.query('SELECT * FROM recipes where unique_id = {}'.format(combined_unique_id)).as_dict()
+            if dupecheck and not debug:
+                continue
+            else:
                 product_recipe_game_id = product_recipe_dict.get('game_id')
                 product_recipe_needs_recipe = product_recipe_dict.get('needs_recipe')
-                product_recipe_unique_id = product_recipe_dict.get('unique_id')
                 product_recipe_output_item = product_recipe_dict.get('output_item')
                 product_recipe_output_quantity = product_recipe_dict.get('output_quantity')
-                combined_unique_id = generate_unique_id(product_recipe_unique_id, component_recipe_unique_id, size=7)
-                dupecheck = db.query('SELECT * FROM recipes where unique_id = {}'.format(combined_unique_id)).as_dict()
-                if dupecheck and not debug:
-                    continue
+                product_recipe_string = product_recipe_dict.get('component_string', '')
+                product_recipe_dict_list = string_to_component_dict_list(product_recipe_string)
+            
+                insert_string = """INSERT INTO recipes (
+game_id, is_altered, needs_recipe, output_item, output_quantity, unique_id, component_string
+                values_string = ") VALUES ({game_id}, {is_altered}, {needs_recipe}, {output_item}, {output_quantity}, {unique_id}"
+
+                for key, value in product_recipe_dict.items():
+                    if key[:4] == 'item':
+                        if value == component_output_item:
+                            components_needed = product_recipe_dict['quantity{}'.format(key[-2:])]
+                            break
+
+                discrepancy_gcd = gcd(component_output_quantity, components_needed)
+                required_discrepancy = components_needed // discrepancy_gcd
+                produced_discrepancy = component_output_quantity // discrepancy_gcd
+
+                combined_ingredients_counter = Counter()
+                for dictionary, discrepancy in zip([product_recipe_dict, component_recipe_dict], [produced_discrepancy, required_discrepancy]):
+                    for inner_slot_number in range(slots):
+                        temp_item = dictionary.get('item{}'.format(str(inner_slot_number).zfill(2)), None)
+                        if temp_item:
+                            if dictionary is product_recipe_dict and temp_item == component_output_item:
+                                continue
+                            temp_quantity = dictionary['quantity{}'.format(str(inner_slot_number).zfill(2))] * discrepancy
+                            combined_ingredients_counter[temp_item] += temp_quantity
+                        else:
+                            break
+
+                combined_recipe_dict = {
+                    'game_id': product_recipe_game_id,
+                    'is_altered': 1,
+                    'output_item': product_recipe_output_item,
+                    'needs_recipe': product_recipe_needs_recipe,
+                    'output_quantity': product_recipe_output_quantity * produced_discrepancy,
+                    'unique_id': combined_unique_id
+                }
+
+            if len(combined_ingredients_counter.most_common()) > slots:
+                update_slots(len(combined_ingredients_counter.most_common()), db=db)
+
+            for number, ingredient_tuple in enumerate(combined_ingredients_counter.most_common()):
+                temp_item, temp_quantity = ingredient_tuple
+                formatted_number = str(number).zfill(2)
+                combined_recipe_dict['item{number}'.format(number=formatted_number)] = temp_item
+                combined_recipe_dict['quantity{number}'.format(number=formatted_number)] = temp_quantity
+                insert_string += ', item{number}, quantity{number}'.format(number=formatted_number)
+                values_string += ', {{item{number}}}, {{quantity{number}}}'.format(number=formatted_number)
+
+            values_string += ');'
+            if dupecheck and debug:
+                # put collision testing here
+                if dupecheck[0] == combined_recipe_dict:
+                    # same number of keys, same names for all keys, each key value matches.
+                    pass
                 else:
-                    insert_string = "INSERT INTO recipes (game_id, is_altered, needs_recipe, output_item, output_quantity, unique_id"
-                    values_string = ") VALUES ({game_id}, {is_altered}, {needs_recipe}, {output_item}, {output_quantity}, {unique_id}"
-
-                    for key, value in product_recipe_dict.items():
-                        if key[:4] == 'item':
-                            if value == component_output_item:
-                                components_needed = product_recipe_dict['quantity{}'.format(key[-2:])]
-                                break
-
-                    discrepancy_gcd = gcd(component_output_quantity, components_needed)
-                    required_discrepancy = components_needed // discrepancy_gcd
-                    produced_discrepancy = component_output_quantity // discrepancy_gcd
-
-                    combined_ingredients_counter = Counter()
-                    for dictionary, discrepancy in zip([product_recipe_dict, component_recipe_dict], [produced_discrepancy, required_discrepancy]):
-                        for inner_slot_number in range(slots):
-                            temp_item = dictionary.get('item{}'.format(str(inner_slot_number).zfill(2)), None)
-                            if temp_item:
-                                if dictionary is product_recipe_dict and temp_item == component_output_item:
-                                    continue
-                                temp_quantity = dictionary['quantity{}'.format(str(inner_slot_number).zfill(2))] * discrepancy
-                                combined_ingredients_counter[temp_item] += temp_quantity
-                            else:
-                                break
-
-                    combined_recipe_dict = {
-                        'game_id': product_recipe_game_id,
-                        'is_altered': 1,
-                        'output_item': product_recipe_output_item,
-                        'needs_recipe': product_recipe_needs_recipe,
-                        'output_quantity': product_recipe_output_quantity * produced_discrepancy,
-                        'unique_id': combined_unique_id
-                    }
-
-                if len(combined_ingredients_counter.most_common()) > slots:
-                    update_slots(len(combined_ingredients_counter.most_common()), db=db)
-
-                for number, ingredient_tuple in enumerate(combined_ingredients_counter.most_common()):
-                    temp_item, temp_quantity = ingredient_tuple
-                    formatted_number = str(number).zfill(2)
-                    combined_recipe_dict['item{number}'.format(number=formatted_number)] = temp_item
-                    combined_recipe_dict['quantity{number}'.format(number=formatted_number)] = temp_quantity
-                    insert_string += ', item{number}, quantity{number}'.format(number=formatted_number)
-                    values_string += ', {{item{number}}}, {{quantity{number}}}'.format(number=formatted_number)
-
-                values_string += ');'
-                if dupecheck and debug:
-                    # put collision testing here
-                    if dupecheck[0] == combined_recipe_dict:
-                        # same number of keys, same names for all keys, each key value matches.
-                        pass
-                    else:
-                        pass
-                else:
-                    db.query(insert_string+values_string.format(**combined_recipe_dict))
-                    added_recipes = True
-                cleanup(verbose=verbose, db=db)
+                    pass
+            else:
+                db.query(insert_string+values_string.format(**combined_recipe_dict))
+                added_recipes = True
+            cleanup(verbose=verbose, db=db)
 
     return added_recipes
 
