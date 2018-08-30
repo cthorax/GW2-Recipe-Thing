@@ -1,0 +1,1 @@
+accepts an API key, parses the known recipes, finds the price of ingredients, and returns any recipes that should turn a profit.
