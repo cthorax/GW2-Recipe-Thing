@@ -52,18 +52,17 @@ def init_items(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
         print('initialising items table')
 
     db.query(query='DROP TABLE IF EXISTS items;')
-    db.query(query='''
-    CREATE TABLE items (
-        id INTEGER PRIMARY KEY,
-        name TEXT,
-        vendor_cost INTEGER DEFAULT 1234567890,
-        karma_cost REAL DEFAULT 999999999999.0,
-        vendor_value INTEGER DEFAULT 0,
-        bound INTEGER,
-        cost_to_buy INTEGER DEFAULT 1234567890,
-        cost_to_sell INTEGER DEFAULT 0
-    );''')
-    db.query(query="INSERT INTO ITEMS (id, vendor_cost, karma_cost, vendor_value, bound, cost_to_buy, cost_to_sell) VALUES (0, 0, 0, 0, 0, 0, 0);")
+    db.query(query="""CREATE TABLE items (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    vendor_cost INTEGER DEFAULT 1234567890,
+    karma_cost REAL DEFAULT 999999999999.0,
+    vendor_value INTEGER DEFAULT 0,
+    bound INTEGER,
+    tp_cost INTEGER DEFAULT 1234567890,
+    tp_value INTEGER DEFAULT 0
+);""")
+    db.query(query="INSERT INTO ITEMS (id, vendor_cost, karma_cost, vendor_value, bound, tp_cost, tp_value) VALUES (0, 0, 0, 0, 0, 0, 0);")
 
 
 def init_recipes(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
@@ -71,26 +70,15 @@ def init_recipes(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')
         print('initialising recipe table')
 
     db.query(query='DROP TABLE IF EXISTS recipes;')
-    initialise = '''
-    CREATE TABLE recipes (
-        game_id INTEGER NOT NULL,
-        is_altered INTEGER,
-        unique_id INTEGER PRIMARY KEY,
-        needs_recipe INTEGER,
-        output_item INTEGER NOT NULL,
-        output_quantity INTEGER NOT NULL'''
-
-    component_template = ''',
-        item{num} INTEGER DEFAULT 0,
-        quantity{num} INTEGER DEFAULT 0'''
-
-    components_string = ''
-    for num in range(slots):
-        components_string = "".join([components_string, component_template.format(num=str(num).zfill(2))])
-
-    initialise += components_string
-    initialise += '''
-    );'''
+    initialise = """CREATE TABLE recipes (
+    game_id INTEGER NOT NULL,
+    is_altered INTEGER,
+    unique_id INTEGER PRIMARY KEY,
+    needs_recipe INTEGER,
+    output_item INTEGER NOT NULL,
+    output_quantity INTEGER NOT NULL,
+    component_string TEXT NOT NULL
+);"""
     db.query(query=initialise)
 
 
@@ -99,43 +87,26 @@ def init_views(verbose=False, db=records.Database(db_url='sqlite:///./gw2.db'), 
         print('initialising views')
 
     db.query(query='DROP VIEW IF EXISTS pricing;')
-    create_string = "CREATE VIEW pricing AS SELECT r.game_id as game_id, r.unique_id as unique_id, i.cost_to_sell*r.output_quantity as revenue"
-    query_template = ", i{number}.cost_to_buy*r.quantity{number} as cost{number}, i{number}.vendor_cost*r.quantity{number} as vendor{number}, i{number}.karma_cost*r.quantity{number} as karma{number}"
-    from_string = " from recipes r left join items i on r.output_item = i.id"
-    join_template = " left join items i{number} on r.item{number} = i{number}.id"
-
-    for number in range(slots):
-        formatted_number = str(number).zfill(2)
-        create_string += query_template.format(number=formatted_number)
-        from_string += join_template.format(number=formatted_number)
-
-    query = create_string+from_string
-    db.query(query=query)
-
-    db.query(query='DROP VIEW IF EXISTS best_prices;')
-    create_string = "CREATE VIEW best_prices AS SELECT unique_id"
-    case_template = ", CASE WHEN cost{number} < vendor{number} AND cost{number} < karma{number} / {karma_conversion} THEN 'cost{number}' WHEN vendor{number} <= cost{number} AND vendor{number} <= karma{number} / {karma_conversion} THEN 'vendor{number}' WHEN karma{number} / {karma_conversion} <= cost{number} AND karma{number} / {karma_conversion} < vendor{number} THEN 'karma{number}' ELSE 0 END 's{number}'"
-    end_string = " from pricing"
-
-    for number in range(slots):
-        formatted_number = str(number).zfill(2)
-        create_string += case_template.format(number=formatted_number, karma_conversion=karma_conversion)
-
-    query = create_string+end_string
-    db.query(query=query)
-
-    db.query(query='DROP VIEW IF EXISTS final_recipe;')
-    create_string = "CREATE VIEW final_recipe AS SELECT r.*, i.name as output_name"
-    query_template = ", i{number}.name as name{number}"
-    from_string = " FROM recipes r LEFT JOIN items i ON r.output_item = i.id"
-    join_template = " LEFT JOIN items i{number} ON r.item{number} = i{number}.id"
-
-    for number in range(slots):
-        formatted_number = str(number).zfill(2)
-        create_string += query_template.format(number=formatted_number)
-        from_string += join_template.format(number=formatted_number)
-
-    query = create_string+from_string
+    create_string = """CREATE VIEW pricing AS
+SELECT tp_cost, vendor_cost, karma_cost,
+    CASE WHEN tp_cost < vendor_cost AND tp_cost < karma_cost / {converter}
+        THEN 'TP'
+    CASE WHEN vendor_cost <= tp_cost AND vendor_cost <= karma_cost / {converter}
+        THEN 'vendor'
+    CASE WHEN karma_cost / {converter} < vendor_cost AND tp_cost >= karma_cost / {converter}
+        THEN 'karma'
+    ELSE 'none'
+    END AS best_method,
+    CASE WHEN tp_cost < vendor_cost AND tp_cost < karma_cost / {converter}
+        THEN tp_cost
+    CASE WHEN vendor_cost <= tp_cost AND vendor_cost <= karma_cost / {converter}
+        THEN vendor_cost
+    CASE WHEN karma_cost / {converter} < vendor_cost AND tp_cost >= karma_cost / {converter}
+        THEN karma_cost
+    ELSE 0
+    END AS best_cost
+FROM items
+);""".format(converter=karma_conversion)
     db.query(query=query)
 
 
@@ -231,7 +202,7 @@ def trading_post_pricing(item_list=None, verbose=False, db=records.Database(db_u
         #todo get rid of this kludge holy shit
         item_list = list(eval(db.query('SELECT id FROM items;').export('csv').replace('\r\n', ', ')[4:]))
 
-    update_string ="UPDATE items SET cost_to_{type} = {cost} WHERE id = {id};"
+    update_string ="UPDATE items SET tp_{type} = {cost} WHERE id = {id};"
 
     item_list_chunks = [item_list[x:x + 200] for x in range(0, len(item_list), 200)]      # 200 is max paging size per wiki on the api v2. this code stolen from stack exchange.
     for batch_number, chunk in enumerate(item_list_chunks):
@@ -248,10 +219,10 @@ def trading_post_pricing(item_list=None, verbose=False, db=records.Database(db_u
 
             if sell_dict:
                 cost_to_sell = sell_dict['unit_price']
-                db.query(query=update_string.format(type='sell', cost=cost_to_sell, id=item_id))
+                db.query(query=update_string.format(type='value', cost=cost_to_sell, id=item_id))
             if buy_dict:
                 cost_to_buy = buy_dict['unit_price']
-                db.query(query=update_string.format(type='buy', cost=cost_to_buy, id=item_id))
+                db.query(query=update_string.format(type='cost', cost=cost_to_buy, id=item_id))
     if verbose:
         print(' - done.')
 
@@ -275,8 +246,11 @@ def populate_recipe_table(recipe_list=None, verbose=False, db=records.Database(d
                     current_recipe=recipe_number +1, total_recipes=len(recipe_dict_list)
                 ), end='')  # zero index
 
-            insert_string = "INSERT INTO recipes(game_id, is_altered, unique_id, output_item, output_quantity, needs_recipe"
-            values_string = "VALUES({id}, 0, {unique_id}, {output_id}, {output_quantity}, {needs_recipe}"
+            insert_string = """INSERT INTO recipes(
+    game_id, is_altered, unique_id, output_item, output_quantity, needs_recipe, component_string
+) VALUES(
+    {id}, 0, {unique_id}, {output_id}, {output_quantity}, {needs_recipe}, {component_string}
+)"""
 
             recipe_id = recipe_dict.get('id')
             if recipe_id in skip_recipes:
@@ -297,20 +271,21 @@ def populate_recipe_table(recipe_list=None, verbose=False, db=records.Database(d
                 needs_recipe = 0
 
             unique_id = generate_unique_id(recipe_id=recipe_id, size=7)
-            values_string = values_string.format(id=recipe_id, output_id=output_item_id, output_quantity=output_quantity, unique_id=unique_id, needs_recipe=needs_recipe)
-
+            
             ingredients = Counter()
             for ingredient in recipe_dict.get('ingredients', []):
                 item_id = ingredient['item_id']
                 quantity = ingredient['count']
                 ingredients[item_id] += quantity
 
-            for number, ingredient_tuple in enumerate(ingredients.most_common()):
-                ingredient_id, ingredient_quantity = ingredient_tuple
-                insert_string += ', item{number}, quantity{number}'.format(number=str(number).zfill(2))
-                values_string += ', {item_id}, {item_quantity}'.format(item_id=ingredient_id, item_quantity=ingredient_quantity)
+            component_string = ''
+            for ingredient_id, ingredient_quantity in ingredients.most_common():
+                component_string += "{ingredient_code}-{count},".format(ingredient_code=int(ingredient_id, 36), count=ingredient_quantity)
 
-            query_string = insert_string + ')\n' + values_string + ');'
+            query_string = insert_string.format(
+                id=recipe_id, output_id=output_item_id, output_quantity=output_quantity, unique_id=unique_id,
+                needs_recipe=needs_recipe, component_string=component_string
+            )
 
             db.query(query=query_string)
             missed_recipes.remove(recipe_id)
