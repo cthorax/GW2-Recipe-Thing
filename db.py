@@ -38,10 +38,12 @@ def component_to_string(item_id, count):
 def string_to_component_dict_list(component_string):
     component_dict_list = []
     for component in component_string.split(','):
+        if component == '':
+            continue
         item_id, count = component.split('-')
         item_id = int(item_id, 36)
 
-        component_dict_list.append({'item_id': item_id, 'count': count})
+        component_dict_list.append({'item_id': int(item_id), 'count': int(count)})
         
     return component_dict_list
 
@@ -351,29 +353,31 @@ VALUES ( {id}, 0, {unique_id}, {output_id}, {output_quantity}, {needs_recipe}, '
 def alternate_recipes(debug=False):
     from math import gcd
     added_recipes = False
+    if verbose:
+        print("\radding alternate recipes", end='')
 
-    component_recipe_dict_list = db.query("SELECT * FROM recipes ORDER BY is_altered ASC, game_id ASC;").as_dict()
+    component_recipe_result_dict_list = db.query("SELECT * FROM recipes ORDER BY is_altered ASC, game_id ASC;").as_dict()
 
-    for component_recipe_number, component_recipe_dict in enumerate(component_recipe_dict_list):
+    for component_recipe_number, component_recipe_dict in enumerate(component_recipe_result_dict_list, start=1):
         component_recipe_unique_id = component_recipe_dict.get('unique_id')
         component_recipe_output_item = component_recipe_dict.get('output_item')
         component_recipe_output_quantity = component_recipe_dict.get('output_quantity')
-        component_output_string = component_to_string(item_id=component_recipe_output_item, count=component_recipe_output_quantity)
+        component_recipe_component_string = component_recipe_dict.get('component_string')
         component_output_search_string = component_to_string(item_id=component_recipe_output_item, count=0)[:-2]
+        component_recipe_dict_list = string_to_component_dict_list(component_recipe_component_string)
         
-        product_recipe_dict_list = db.query("SELECT * FROM recipes WHERE component_string LIKE '{search}'".format(search=component_output_search_string))
-        for product_recipe_number, product_recipe_dict in enumerate(product_recipe_dict_list):
+        product_recipe_result_dict_list = db.query("SELECT * FROM recipes WHERE component_string LIKE '%{search}%'".format(search=component_output_search_string)).as_dict()
+        for product_recipe_number, product_recipe_dict in enumerate(product_recipe_result_dict_list, start=1):
             if verbose:
-                print(
-                    '\radding alternate recipes - component recipe {component} of {max_components} - product recipe {product} of {max_products}'.format(
-                        component=component_recipe_number, max_components=len(component_recipe_dict_list),
-                        product=product_recipe_number, max_products=len(product_recipe_dict_list),
-                    ), end='')
+                print('\radding alternate recipes - component recipe:\t{component} of {max_components} - product recipe:\t{product} of {max_products}'.format(
+                        component=component_recipe_number, max_components=len(component_recipe_result_dict_list),
+                        product=product_recipe_number, max_products=len(product_recipe_result_dict_list),
+                ), end='')
 
             product_recipe_unique_id = product_recipe_dict.get('unique_id')
             combined_unique_id = generate_unique_id(product_recipe_unique_id, component_recipe_unique_id, size=7)
             dupecheck = db.query('SELECT * FROM recipes where unique_id = {}'.format(combined_unique_id)).as_dict()
-            if dupecheck and not debug:
+            if dupecheck is not [] and debug is False:
                 continue
             else:
                 product_recipe_game_id = product_recipe_dict.get('game_id')
@@ -395,27 +399,20 @@ VALUES ( {game_id}, {is_altered}, {needs_recipe}, {output_item}, {output_quantit
                 component_multiplier = components_needed // discrepancy_gcd
                 product_multiplier = component_recipe_output_quantity // discrepancy_gcd
 
-                
-
-                combined_recipe_string = combine_dict_list_to_string([product_recipe_dict_list]*product_multiplier + [component_recipe_dict]*component_multiplier, item_to_remove=None)
+                combined_recipe_string = combine_dict_list_to_string([product_recipe_dict_list]*product_multiplier + [component_recipe_dict_list]*component_multiplier, item_to_remove=component_recipe_output_item)
                 combined_recipe_dict = {
                     'game_id': product_recipe_game_id,
                     'is_altered': 1,
                     'output_item': product_recipe_output_item,
                     'needs_recipe': product_recipe_needs_recipe,
-                    'output_quantity': product_recipe_output_quantity * produced_discrepancy,
+                    'output_quantity': product_recipe_output_quantity * product_multiplier,
                     'unique_id': combined_unique_id,
                     'component_string': combined_recipe_string
                 }
 
-                db.query(insert_string.format(**combined_recipe_dict))
-
                 if dupecheck and debug:
                     # put collision testing here
-                    if dupecheck[0] == combined_recipe_dict:
-                        # same number of keys, same names for all keys, each key value matches.
-                        pass
-                    else:
+                    if dupecheck[0] != combined_recipe_dict:
                         pass
                 
                 else:
@@ -430,10 +427,7 @@ def get_price(recipe_id):       #todo: update this
     revenue_string = " revenue"
     cost_template = " - {number}"
     as_string = " AS profit FROM pricing WHERE game_id = {recipe_id} ORDER BY profit LIMIT 1".format(recipe_id=recipe_id)
-    for number in range(slots):
-        bracketed_number = '{s' + str(number).zfill(2) + '}'
-        select_string += " {},".format(bracketed_number)
-        revenue_string += cost_template.format(number=bracketed_number)
+
     pricing_query = select_string + revenue_string + as_string
 
     unique_id_dict_list = db.query("SELECT unique_id FROM recipes WHERE game_id = {recipe_id}".format(recipe_id=recipe_id)).as_dict()
@@ -529,17 +523,30 @@ def generate_unique_id(recipe_id, other_recipe_id=0, size=0):
     return unique_id
 
 
+def vacuum():
+    if verbose:
+        from os.path import getsize
+        before = getsize(db.db_url[10:])
+        db.query('VACUUM;')
+        after = getsize(db.db_url[10:])
+        percentage = 1 - after/before
+        print('db cleanup resulted in a {percentage:.3%} reduction in db size'.format(percentage=percentage))
+
+    else:
+        db.query('VACUUM;')
+
+
 if __name__ == '__main__':
     init_items_flag = False
-    init_recipes_flag = True
+    init_recipes_flag = False
+    add_alt_recipes = True
     
     if init_items_flag:
         init_items()
         populate_items()
         vendor_pricing()
         trading_post_pricing()
-        
-    db.query("VACUUM;")
+        vacuum()
 
     if init_recipes_flag:
         init_recipes()
@@ -547,12 +554,16 @@ if __name__ == '__main__':
         missed_recipes = populate_recipe_table()
         while missed_recipes:
             missed_recipes = populate_recipe_table(recipe_list=missed_recipes)
+            vacuum()
 
-        db.query("VACUUM;")
+    if add_alt_recipes:
+        added_recipes = True
+        while added_recipes:
+            vacuum()
+            added_recipes = alternate_recipes(debug=True)
 
-    added_recipes = alternate_recipes(debug=True)
-    while added_recipes:
-        added_recipes = alternate_recipes(debug=True)
+    if init_items_flag is False and init_recipes_flag is False and add_alt_recipes:
+        vacuum()
 
     recipe_list = api_query(payload='', endpoint='recipe_details')
     if verbose:
