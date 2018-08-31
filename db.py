@@ -10,13 +10,28 @@ config = configparser.ConfigParser()
 config.read('config.ini')
 
 karma_conversion = config['db_only']['karma_conversion']
-verbose = config['all files'].getboolean('verbose')
-db_url = config['all files']['db_url']
+verbose = config['all_files'].getboolean('verbose')
+db_url = config['all_files']['db_url']
 db = records.Database(db_url=db_url)
 
 
+def base36encode(number):
+    """Converts an integer to a base36 string."""       # stolen from stackoverflow.com/questions/1181919/python-base-36-encoding
+    alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+    if 0 <= number < len(alphabet):
+        return alphabet[number]
+
+    base36 = ''
+    while number != 0:
+        number, i = divmod(number, len(alphabet))
+        base36 = alphabet[i] + base36
+
+    return base36
+
+
 def component_to_string(item_id, count):
-    component_string = "{ingredient_code}-{count},".format(ingredient_code=int(item_id, 36), count=count)
+    component_string = "{ingredient_code}-{count},".format(ingredient_code=base36encode(item_id), count=count)
     return component_string
 
 
@@ -24,6 +39,8 @@ def string_to_component_dict_list(component_string):
     component_dict_list = []
     for component in component_string.split(','):
         item_id, count = component.split('-')
+        item_id = int(item_id, 36)
+
         component_dict_list.append({'item_id': item_id, 'count': count})
         
     return component_dict_list
@@ -40,6 +57,22 @@ def dict_list_to_string(recipe_dict_list):
     for ingredient_id, ingredient_quantity in ingredients.most_common():
         component_string += component_to_string(item_id=ingredient_id, count=ingredient_quantity)
         
+    return component_string
+
+
+def combine_dict_list_to_string(list_of_dict_lists, item_to_remove=None):
+    ingredients = Counter()
+    for dict_list in list_of_dict_lists:
+        for ingredient in dict_list:
+            item_id = ingredient['item_id']
+            if item_to_remove != item_id:
+                quantity = ingredient['count']
+                ingredients[item_id] += quantity
+
+    component_string = ''
+    for ingredient_id, ingredient_quantity in ingredients.most_common():
+        component_string += component_to_string(item_id=ingredient_id, count=ingredient_quantity)
+
     return component_string
 
 
@@ -124,26 +157,18 @@ def init_views():      # karma conversion is how much  karma is worth 1 coin
 
     db.query(query='DROP VIEW IF EXISTS pricing;')
     create_string = """CREATE VIEW pricing AS
-SELECT tp_cost, vendor_cost, karma_cost,
-    CASE WHEN tp_cost < vendor_cost AND tp_cost < karma_cost / {converter}
-        THEN 'TP'
-    CASE WHEN vendor_cost <= tp_cost AND vendor_cost <= karma_cost / {converter}
-        THEN 'vendor'
-    CASE WHEN karma_cost / {converter} < vendor_cost AND tp_cost >= karma_cost / {converter}
-        THEN 'karma'
-    ELSE 'none'
-    END AS best_method,
-    CASE WHEN tp_cost < vendor_cost AND tp_cost < karma_cost / {converter}
-        THEN tp_cost
-    CASE WHEN vendor_cost <= tp_cost AND vendor_cost <= karma_cost / {converter}
-        THEN vendor_cost
-    CASE WHEN karma_cost / {converter} < vendor_cost AND tp_cost >= karma_cost / {converter}
-        THEN karma_cost
-    ELSE 0
-    END AS best_cost
-FROM items
-);""".format(converter=karma_conversion)
-    db.query(query=query)
+    SELECT tp_cost, vendor_cost, karma_cost,
+        CASE WHEN tp_cost < vendor_cost AND tp_cost < karma_cost / {converter} THEN 'TP'
+            WHEN vendor_cost <= tp_cost AND vendor_cost <= karma_cost / {converter} THEN 'vendor'
+            WHEN karma_cost / {converter} < vendor_cost AND tp_cost >= karma_cost / {converter} THEN 'karma'
+        ELSE 'none' END AS best_method,
+        
+        CASE WHEN tp_cost < vendor_cost AND tp_cost < karma_cost / {converter} THEN tp_cost
+            WHEN vendor_cost <= tp_cost AND vendor_cost <= karma_cost / {converter} THEN vendor_cost
+            WHEN karma_cost / {converter} < vendor_cost AND tp_cost >= karma_cost / {converter} THEN karma_cost
+        ELSE 0 END AS best_cost
+    FROM items""".format(converter=karma_conversion)
+    db.query(query=create_string)
 
 
 def populate_items(item_id_list=None):
@@ -273,20 +298,17 @@ def populate_recipe_table(recipe_list=None):
     skip_recipes = []
 
     recipe_list_chunks = [recipe_list[x:x + 200] for x in range(0, len(recipe_list), 200)]      # 200 is max paging size per wiki on the api v2. this code stolen from stack exchange.
-    for batch_number, chunk in enumerate(recipe_list_chunks):
+    for batch_number, chunk in enumerate(recipe_list_chunks, start=1):
         recipe_dict_list = api_query(payload=chunk, endpoint='multi_recipe')
-        for recipe_number, recipe_dict in enumerate(recipe_dict_list):
+        for recipe_number, recipe_dict in enumerate(recipe_dict_list, start=1):
             if verbose:
                 print('\rpopulating recipe table - chunk {current_chunk} of {total_chunks} - recipe {current_recipe} of {total_recipes}'.format(
-                    current_chunk=batch_number +1, total_chunks=len(recipe_list_chunks),
-                    current_recipe=recipe_number +1, total_recipes=len(recipe_dict_list)
-                ), end='')  # zero index
+                    current_chunk=batch_number, total_chunks=len(recipe_list_chunks),
+                    current_recipe=recipe_number, total_recipes=len(recipe_dict_list)
+                ), end='')
 
-            insert_string = """INSERT INTO recipes(
-    game_id, is_altered, unique_id, output_item, output_quantity, needs_recipe, component_string
-) VALUES(
-    {id}, 0, {unique_id}, {output_id}, {output_quantity}, {needs_recipe}, {component_string}
-)"""
+            insert_string = """INSERT INTO recipes ( game_id, is_altered, unique_id, output_item, output_quantity, needs_recipe, component_string )
+VALUES ( {id}, 0, {unique_id}, {output_id}, {output_quantity}, {needs_recipe}, '{component_string}' )"""
 
             recipe_id = recipe_dict.get('id')
             if recipe_id in skip_recipes:
@@ -308,7 +330,7 @@ def populate_recipe_table(recipe_list=None):
 
             unique_id = generate_unique_id(recipe_id=recipe_id, size=7)
 
-            component_string = dict_list_to_string(dict_list=recipe_dict.get('ingredients', []))
+            component_string = dict_list_to_string(recipe_dict_list=recipe_dict.get('ingredients', []))
 
             query_string = insert_string.format(
                 id=recipe_id, output_id=output_item_id, output_quantity=output_quantity, unique_id=unique_id,
@@ -336,10 +358,10 @@ def alternate_recipes(debug=False):
         component_recipe_unique_id = component_recipe_dict.get('unique_id')
         component_recipe_output_item = component_recipe_dict.get('output_item')
         component_recipe_output_quantity = component_recipe_dict.get('output_quantity')
-        component_output_string = component_to_string(item_id=component_output_item, count=component_output_quantity)
-        component_output_search_string = component_to_string(item_id=component_output_item, count=0)[:-2]
+        component_output_string = component_to_string(item_id=component_recipe_output_item, count=component_recipe_output_quantity)
+        component_output_search_string = component_to_string(item_id=component_recipe_output_item, count=0)[:-2]
         
-        product_recipe_dict_list = db.query("SELECT * FROM recipes WHERE component_string LIKE '{component_output_search_string}'")
+        product_recipe_dict_list = db.query("SELECT * FROM recipes WHERE component_string LIKE '{search}'".format(search=component_output_search_string))
         for product_recipe_number, product_recipe_dict in enumerate(product_recipe_dict_list):
             if verbose:
                 print(
@@ -361,69 +383,49 @@ def alternate_recipes(debug=False):
                 product_recipe_string = product_recipe_dict.get('component_string', '')
                 product_recipe_dict_list = string_to_component_dict_list(product_recipe_string)
             
-                insert_string = """INSERT INTO recipes (
-game_id, is_altered, needs_recipe, output_item, output_quantity, unique_id, component_string
-                values_string = ") VALUES ({game_id}, {is_altered}, {needs_recipe}, {output_item}, {output_quantity}, {unique_id}"
+                insert_string = """INSERT INTO recipes ( game_id, is_altered, needs_recipe, output_item, output_quantity, unique_id, component_string )
+VALUES ( {game_id}, {is_altered}, {needs_recipe}, {output_item}, {output_quantity}, {unique_id}, '{component_string}' )"""
 
-                for key, value in product_recipe_dict.items():
-                    if key[:4] == 'item':
-                        if value == component_output_item:
-                            components_needed = product_recipe_dict['quantity{}'.format(key[-2:])]
-                            break
+                for product_recipe_dict in product_recipe_dict_list:
+                    if product_recipe_dict['item_id'] == component_recipe_output_item:
+                        components_needed = product_recipe_dict['count']
+                        break
 
-                discrepancy_gcd = gcd(component_output_quantity, components_needed)
-                required_discrepancy = components_needed // discrepancy_gcd
-                produced_discrepancy = component_output_quantity // discrepancy_gcd
+                discrepancy_gcd = gcd(component_recipe_output_quantity, components_needed)
+                component_multiplier = components_needed // discrepancy_gcd
+                product_multiplier = component_recipe_output_quantity // discrepancy_gcd
 
-                combined_ingredients_counter = Counter()
-                for dictionary, discrepancy in zip([product_recipe_dict, component_recipe_dict], [produced_discrepancy, required_discrepancy]):
-                    for inner_slot_number in range(slots):
-                        temp_item = dictionary.get('item{}'.format(str(inner_slot_number).zfill(2)), None)
-                        if temp_item:
-                            if dictionary is product_recipe_dict and temp_item == component_output_item:
-                                continue
-                            temp_quantity = dictionary['quantity{}'.format(str(inner_slot_number).zfill(2))] * discrepancy
-                            combined_ingredients_counter[temp_item] += temp_quantity
-                        else:
-                            break
+                
 
+                combined_recipe_string = combine_dict_list_to_string([product_recipe_dict_list]*product_multiplier + [component_recipe_dict]*component_multiplier, item_to_remove=None)
                 combined_recipe_dict = {
                     'game_id': product_recipe_game_id,
                     'is_altered': 1,
                     'output_item': product_recipe_output_item,
                     'needs_recipe': product_recipe_needs_recipe,
                     'output_quantity': product_recipe_output_quantity * produced_discrepancy,
-                    'unique_id': combined_unique_id
+                    'unique_id': combined_unique_id,
+                    'component_string': combined_recipe_string
                 }
 
-            if len(combined_ingredients_counter.most_common()) > slots:
-                update_slots(len(combined_ingredients_counter.most_common()), db=db)
+                db.query(insert_string.format(**combined_recipe_dict))
 
-            for number, ingredient_tuple in enumerate(combined_ingredients_counter.most_common()):
-                temp_item, temp_quantity = ingredient_tuple
-                formatted_number = str(number).zfill(2)
-                combined_recipe_dict['item{number}'.format(number=formatted_number)] = temp_item
-                combined_recipe_dict['quantity{number}'.format(number=formatted_number)] = temp_quantity
-                insert_string += ', item{number}, quantity{number}'.format(number=formatted_number)
-                values_string += ', {{item{number}}}, {{quantity{number}}}'.format(number=formatted_number)
-
-            values_string += ');'
-            if dupecheck and debug:
-                # put collision testing here
-                if dupecheck[0] == combined_recipe_dict:
-                    # same number of keys, same names for all keys, each key value matches.
-                    pass
+                if dupecheck and debug:
+                    # put collision testing here
+                    if dupecheck[0] == combined_recipe_dict:
+                        # same number of keys, same names for all keys, each key value matches.
+                        pass
+                    else:
+                        pass
+                
                 else:
-                    pass
-            else:
-                db.query(insert_string+values_string.format(**combined_recipe_dict))
-                added_recipes = True
-            cleanup(verbose=verbose, db=db)
+                    db.query(insert_string.format(**combined_recipe_dict))
+                    added_recipes = True
 
     return added_recipes
 
 
-def get_price(recipe_id):
+def get_price(recipe_id):       #todo: update this
     select_string = "SELECT"
     revenue_string = " revenue"
     cost_template = " - {number}"
@@ -529,7 +531,7 @@ def generate_unique_id(recipe_id, other_recipe_id=0, size=0):
 
 if __name__ == '__main__':
     init_items_flag = False
-    init_recipes_flag = False
+    init_recipes_flag = True
     
     if init_items_flag:
         init_items()
@@ -537,16 +539,16 @@ if __name__ == '__main__':
         vendor_pricing()
         trading_post_pricing()
         
-    db.query("VACUUM()")
+    db.query("VACUUM;")
 
     if init_recipes_flag:
         init_recipes()
-        init_views)
+        init_views()
         missed_recipes = populate_recipe_table()
         while missed_recipes:
             missed_recipes = populate_recipe_table(recipe_list=missed_recipes)
 
-        db.query("VACUUM()")
+        db.query("VACUUM;")
 
     added_recipes = alternate_recipes(debug=True)
     while added_recipes:
