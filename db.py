@@ -10,6 +10,9 @@ config = configparser.ConfigParser()
 config.read('config.ini')
 
 karma_conversion = config['db_only']['karma_conversion']
+init_items_flag = config['db_only'].getboolean('init_items_flag')
+init_recipes_flag = config['db_only'].getboolean('init_items_flag')
+add_alt_recipes = config['db_only'].getboolean('add_alt_recipes')
 verbose = config['all_files'].getboolean('verbose')
 db_url = config['all_files']['db_url']
 db = records.Database(db_url=db_url)
@@ -31,7 +34,7 @@ def base36encode(number):
 
 
 def component_to_string(item_id, count):
-    component_string = "{ingredient_code}-{count},".format(ingredient_code=base36encode(item_id), count=count)
+    component_string = "!{ingredient_code}*{count},".format(ingredient_code=base36encode(item_id), count=count)
     return component_string
 
 
@@ -40,8 +43,8 @@ def string_to_component_dict_list(component_string):
     for component in component_string.split(','):
         if component == '':
             continue
-        item_id, count = component.split('-')
-        item_id = int(item_id, 36)
+        item_id, count = component.split('*')
+        item_id = int(item_id[1:], 36)
 
         component_dict_list.append({'item_id': int(item_id), 'count': int(count)})
         
@@ -93,15 +96,15 @@ def api_query(payload, endpoint, default=None):
     elif endpoint == 'item_pricing':
         url = "https://api.guildwars2.com/v2/commerce/prices/{}".format(payload)
     elif endpoint == 'multi_item':
-        assert isinstance(payload, list)
+        assert isinstance(payload, (list, tuple))
         list_string = str(payload)[1:-1].replace(' ', '')    # strips '[' and ']' from str representation.
         url = "https://api.guildwars2.com/v2/items?ids={}".format(list_string)
     elif endpoint == 'multi_recipe':
-        assert isinstance(payload, list)
+        assert isinstance(payload, (list, tuple))
         list_string = str(payload)[1:-1].replace(' ', '')    # strips '[' and ']' from str representation.
         url = "https://api.guildwars2.com/v2/recipes?ids={}".format(list_string)
     elif endpoint == 'multi_pricing':
-        assert isinstance(payload, list)
+        assert isinstance(payload, (list, tuple))
         list_string = str(payload)[1:-1].replace(' ', '')    # strips '[' and ']' from str representation.
         url = "https://api.guildwars2.com/v2/commerce/prices?ids={}".format(list_string)
 
@@ -124,7 +127,7 @@ def init_items():
 
     db.query(query='DROP TABLE IF EXISTS items;')
     db.query(query="""CREATE TABLE items (
-    id INTEGER PRIMARY KEY,
+    item_id INTEGER PRIMARY KEY,
     name TEXT,
     vendor_cost INTEGER DEFAULT 1234567890,
     karma_cost REAL DEFAULT 999999999999.0,
@@ -133,7 +136,7 @@ def init_items():
     tp_cost INTEGER DEFAULT 1234567890,
     tp_value INTEGER DEFAULT 0
 );""")
-    db.query(query="INSERT INTO ITEMS (id, vendor_cost, karma_cost, vendor_value, bound, tp_cost, tp_value) VALUES (0, 0, 0, 0, 0, 0, 0);")
+    db.query(query="INSERT INTO ITEMS (item_id, vendor_cost, karma_cost, vendor_value, bound, tp_cost, tp_value) VALUES (0, 0, 0, 0, 0, 0, 0);")
 
 
 def init_recipes():
@@ -159,8 +162,8 @@ def init_views():      # karma conversion is how much  karma is worth 1 coin
 
     db.query(query='DROP VIEW IF EXISTS pricing;')
     create_string = """CREATE VIEW pricing AS
-    SELECT tp_cost, vendor_cost, karma_cost,
-        CASE WHEN tp_cost < vendor_cost AND tp_cost < karma_cost / {converter} THEN 'TP'
+    SELECT item_id, name, tp_cost, vendor_cost, karma_cost,
+        CASE WHEN tp_cost < vendor_cost AND tp_cost < karma_cost / {converter} THEN 'tp'
             WHEN vendor_cost <= tp_cost AND vendor_cost <= karma_cost / {converter} THEN 'vendor'
             WHEN karma_cost / {converter} < vendor_cost AND tp_cost >= karma_cost / {converter} THEN 'karma'
         ELSE 'none' END AS best_method,
@@ -184,8 +187,8 @@ def populate_items(item_id_list=None):
     for batch_number, chunk in enumerate(item_list_chunks):
         with_values_flag = False
         without_values_flag = False
-        insert_string_with_value = "INSERT INTO items(id, name, vendor_value, bound) VALUES ("
-        insert_string_without_value = "INSERT INTO items(id, name, bound) VALUES ("
+        insert_string_with_value = "INSERT INTO items(item_id, name, vendor_value, bound) VALUES ("
+        insert_string_without_value = "INSERT INTO items(item_id, name, bound) VALUES ("
         item_details_list = api_query(payload=chunk, endpoint='multi_item', default=[])
         for item_number, item_dict in enumerate(item_details_list):
             if verbose:
@@ -225,7 +228,7 @@ def populate_items(item_id_list=None):
     if verbose:
         print(' - done.')
 
-    db.query('VACUUM;')
+    vacuum()
 
 
 def vendor_pricing(vendor_dict=None):
@@ -234,7 +237,7 @@ def vendor_pricing(vendor_dict=None):
         print('adding vendor pricing')
 
     if vendor_dict is None:
-        with open('D:\Python\STUFF I WROTE\GW2 Recipe Thing\\vendor_dict.pickle', 'rb') as itemlist_file:
+        with open('D:\STUFF I WROTE\GW2 Recipe Thing\\vendor_dict.pickle', 'rb') as itemlist_file:
             try:
                 vendor_dict = pickle.load(file=itemlist_file)
             except FileNotFoundError:
@@ -243,11 +246,11 @@ def vendor_pricing(vendor_dict=None):
     update_cost_string = '''
     UPDATE items
     SET vendor_cost = {cost}
-    WHERE id = {id};'''
+    WHERE item_id = {id};'''
     update_karma_string = '''
     UPDATE items
     SET karma_cost = {karma}
-    WHERE id = {id};'''
+    WHERE item_id = {id};'''
 
     for item_id, costs in vendor_dict.items():
         vendor_cost = costs.get('vendor', None)
@@ -257,20 +260,20 @@ def vendor_pricing(vendor_dict=None):
         if karma_cost:
             db.query(query=update_karma_string.format(id=item_id, karma=karma_cost))
 
-    db.query('VACUUM;')
+    vacuum()
 
 
-def trading_post_pricing(item_list=None, verbose=False, db=records.Database(db_url='sqlite:///./gw2.db')):
+def trading_post_pricing(item_list=None):
     if item_list is None:
         #todo get rid of this kludge holy shit
-        item_list = list(eval(db.query('SELECT id FROM items;').export('csv').replace('\r\n', ', ')[4:]))
+        item_list = eval(db.query('SELECT item_id FROM items;').export('csv').replace('\r\n', ', ')[9:])
 
-    update_string ="UPDATE items SET tp_{type} = {cost} WHERE id = {id};"
+    update_string ="UPDATE items SET tp_{type} = {cost} WHERE item_id = {id};"
 
     item_list_chunks = [item_list[x:x + 200] for x in range(0, len(item_list), 200)]      # 200 is max paging size per wiki on the api v2. this code stolen from stack exchange.
-    for batch_number, chunk in enumerate(item_list_chunks):
+    for batch_number, chunk in enumerate(item_list_chunks, start=1):
         if verbose:
-            print('\rupdating trading post pricing - chunk {current} of {total}'.format(current=batch_number+1, total=len(item_list_chunks)), end='')     # zero index
+            print('\rupdating trading post pricing - chunk {current} of {total}'.format(current=batch_number, total=len(item_list_chunks)), end='')
 
         pricing_dict_list = api_query(payload=chunk, endpoint='multi_pricing', default=[])
 
@@ -289,7 +292,7 @@ def trading_post_pricing(item_list=None, verbose=False, db=records.Database(db_u
     if verbose:
         print(' - done.')
 
-    db.query('VACUUM;')
+    vacuum()
 
 
 def populate_recipe_table(recipe_list=None):
@@ -346,7 +349,7 @@ VALUES ( {id}, 0, {unique_id}, {output_id}, {output_quantity}, {needs_recipe}, '
     if verbose:
         print(' - done.')
 
-    db.query('VACUUM;')
+    vacuum()
     return missed_recipes
 
 
@@ -358,7 +361,17 @@ def alternate_recipes(debug=False):
 
     component_recipe_result_dict_list = db.query("SELECT * FROM recipes ORDER BY is_altered ASC, game_id ASC;").as_dict()
 
+    unique_id_list = []
+    component_string_list = []
+    for entry in component_recipe_result_dict_list:
+        unique_id_list.append(entry['unique_id'])
+        component_string_list.append(entry['component_string'])
+
     for component_recipe_number, component_recipe_dict in enumerate(component_recipe_result_dict_list, start=1):
+        if verbose:
+            print('\radding alternate recipes - component recipe:\t{component} of {max_components}'.format(
+                component=component_recipe_number, max_components=len(component_recipe_result_dict_list)
+            ), end='')
         component_recipe_unique_id = component_recipe_dict.get('unique_id')
         component_recipe_output_item = component_recipe_dict.get('output_item')
         component_recipe_output_quantity = component_recipe_dict.get('output_quantity')
@@ -376,8 +389,7 @@ def alternate_recipes(debug=False):
 
             product_recipe_unique_id = product_recipe_dict.get('unique_id')
             combined_unique_id = generate_unique_id(product_recipe_unique_id, component_recipe_unique_id, size=7)
-            dupecheck = db.query('SELECT * FROM recipes where unique_id = {}'.format(combined_unique_id)).as_dict()
-            if dupecheck is not [] and debug is False:
+            if combined_unique_id in unique_id_list:
                 continue
             else:
                 product_recipe_game_id = product_recipe_dict.get('game_id')
@@ -410,86 +422,144 @@ VALUES ( {game_id}, {is_altered}, {needs_recipe}, {output_item}, {output_quantit
                     'component_string': combined_recipe_string
                 }
 
-                if dupecheck and debug:
-                    # put collision testing here
-                    if dupecheck[0] != combined_recipe_dict:
-                        pass
-                
+                if combined_recipe_string in component_string_list:
+                    continue
+
                 else:
                     db.query(insert_string.format(**combined_recipe_dict))
+                    unique_id_list.append(combined_unique_id)
+                    component_string_list.append(combined_recipe_string)
                     added_recipes = True
+
+    if verbose:
+        print(' - done.')
 
     return added_recipes
 
 
-def get_price(recipe_id):       #todo: update this
-    select_string = "SELECT"
-    revenue_string = " revenue"
-    cost_template = " - {number}"
-    as_string = " AS profit FROM pricing WHERE game_id = {recipe_id} ORDER BY profit LIMIT 1".format(recipe_id=recipe_id)
+def best_recipe_by_recipe_id(recipe_id):
+    output_item = db.query("SELECT output_item FROM recipes WHERE game_id = {recipe_id} LIMIT 1".format(recipe_id=recipe_id)).as_dict()
+    try:
+        output_item = output_item[0]['output_item']
+        output_item_info = db.query("SELECT name, item_id, tp_value, vendor_value FROM items WHERE item_id = {item_id}".format(item_id=output_item)).as_dict()[0]
+        alternate_recipe_dict_list = db.query("SELECT * FROM recipes WHERE game_id = {recipe_id}".format(recipe_id=recipe_id)).as_dict()
+        output_dict = best_recipe_by_recipe_list(recipe_dict_list=alternate_recipe_dict_list, output_item_info=output_item_info)
 
-    pricing_query = select_string + revenue_string + as_string
+        if output_dict:
+            print("\nbest method for recipe {game_id}:\nprofit: {profit}\nmethod:{method}\n".format(**output_dict))
+        else:
+            if verbose:
+                print('no profitable version of recipe {game_id}'.format(game_id=recipe_id))
 
-    unique_id_dict_list = db.query("SELECT unique_id FROM recipes WHERE game_id = {recipe_id}".format(recipe_id=recipe_id)).as_dict()
-    best_profit = 0
-    best_string = ''
-    best_profit_dict = None
+        return None
+    except LookupError:
+        print('error in lookup for recipe {recipe_id}'.format(recipe_id=recipe_id))
+        return True
 
-    for unique_id_dict in unique_id_dict_list:
-        unique_id = unique_id_dict['unique_id']
-        best_price_slot_dict_list = db.query("SELECT * FROM best_prices WHERE unique_id = {unique_id}".format(unique_id=unique_id)).as_dict()
-        for best_price_slot_dict in best_price_slot_dict_list:
-            query = pricing_query.format(**best_price_slot_dict)
-            revenue_dict_list = db.query(query=query).as_dict()
-            for revenue_dict in revenue_dict_list:
-                profit = revenue_dict['profit']
-                if profit:
-                    if profit > best_profit:
-                        best_profit = profit
-                        best_string = unique_id
-                        best_profit_dict = revenue_dict
-                    else:
-                        continue
-                else:
-                    continue
 
-    if best_profit_dict:
-        cleaned_profit_dict = {'cost_sum': 0, 'karma_sum': 0}
-        for key, value in best_profit_dict.items():
-            if value != 0 and value is not None:
-                cleaned_profit_dict[key] = value
-                if key[:-2] == 'cost' or key[:-2] == 'vendor':
-                    cleaned_profit_dict['cost_sum'] += value
-                elif key[:-2] == 'karma':
-                    cleaned_profit_dict['karma_sum'] += value
+def best_recipe_by_component(item_id):
+    try:
+        item_info = db.query("SELECT name, item_id, tp_value, vendor_value FROM items WHERE item_id = {item_id}".format(item_id=item_id)).as_dict()[0]
+        if item_info['tp_value'] > item_info['vendor_value']:
+            price_to_beat = item_info['tp_value']
+            default_method = 'tp'
+        else:
+            price_to_beat = item_info['vendor_value']
+            default_method = 'vendor'
+        search_string = component_to_string(item_id=item_id, count=0)[:-2]
+        recipe_list = db.query("SELECT * FROM recipes WHERE component_string LIKE '%{search}%'".format(search=search_string)).as_dict()
+        output_dict = best_recipe_by_recipe_list(recipe_dict_list=recipe_list)
 
-        final_recipe_dict_list = db.query("SELECT * FROM final_recipe WHERE unique_id = {unique_id}".format(unique_id=best_string)).as_dict()
-        for final_recipe_dict in final_recipe_dict_list:
-            print("\nRECIPE ID:\t{game_id}\nCREATES:\t{output_quantity}x {output_name}\nINGREDIENTS:".format(**final_recipe_dict))
-            for slot_key in cleaned_profit_dict.keys():
-                type, number = slot_key[:-2], slot_key[-2:]
-                if number == 'it' or number == 'um':
-                    continue
-                temp_name = final_recipe_dict['name{}'.format(number)]
-                temp_quantity = final_recipe_dict['quantity{}'.format(number)]
-                if type == 'cost':
-                    item_price = '\tbuy item from TP for {} total'.format(format_prices(cleaned_profit_dict[slot_key]))
-                elif type == 'vendor':
-                    item_price = '\tbuy item from vendor for {} total'.format(format_prices(cleaned_profit_dict[slot_key]))
-                elif type == 'karma':
-                    item_price = '\tbuy item from vendor for {} karma total'.format(cleaned_profit_dict[slot_key])
-                print('{quantity}x {name} - {cost}'.format(cost=item_price, name=temp_name, quantity=temp_quantity))
-            if cleaned_profit_dict['cost_sum'] and cleaned_profit_dict['karma_sum']:
-                print('TOTAL COST:\t\t{cost}, {karma} karma'.format(cost=format_prices(cleaned_profit_dict['cost_sum']), karma=cleaned_profit_dict['karma_sum']))
-            elif cleaned_profit_dict['cost_sum']:
-                print('TOTAL COST:\t\t{cost}'.format(cost=format_prices(cleaned_profit_dict['cost_sum'])))
-            elif cleaned_profit_dict['karma_sum']:
-                print('TOTAL COST:\t\t{karma} karma'.format(karma=cleaned_profit_dict['karma_sum']))
-            print('TOTAL PROFIT:\t{profit}\n'.format(profit=format_prices(cleaned_profit_dict['profit'])))
+        if output_dict:
+            for item in output_dict['raw_method']:
+                if item['item'] == item_info['name']:
+                    count = item['count']
+                    break
+
+            if price_to_beat < output_dict['raw_profit'] / count:
+                output_string = "best recipe for item {name}:\nrecipe \{game_id\}:\nprofit: \{profit\}\nmethod:\{method\}\n".format(name=item_info['name'])
+                print(output_string.format(**output_dict))
+
+            else:
+                print("just sell the {name} at {method} for {price}".format(name=item_info['name'], method=default_method, price=price_to_beat))
+        else:
+            print("just sell the {name} at {method} for {price}".format(name=item_info['name'], method=default_method, price=price_to_beat))
+    except LookupError:
+        print('lookup error on item {item_id}.'.format(item_id=item_id))
+
+
+def best_recipe_by_recipe_list(recipe_dict_list, output_item_info=None):
+    profit_dict_list = []
+    for recipe_dict in recipe_dict_list:
+        if output_item_info is None:
+            output_item = recipe_dict['output_item']
+            output_item_info = db.query("SELECT name, item_id, tp_value, vendor_value FROM items WHERE item_id = {item_id}".format(item_id=output_item)).as_dict()[0]
+
+        ingredient_list = string_to_component_dict_list(recipe_dict['component_string'])
+        output_count = recipe_dict['output_quantity']
+        tp_revenue = output_item_info['tp_value'] * output_count
+        vendor_revenue = output_item_info['vendor_value'] * output_count
+        if tp_revenue > vendor_revenue:
+            best_revenue = tp_revenue
+            output_method_dict = {
+                'type': 'sell',
+                'count': output_count,
+                'item': output_item_info['name'],
+                'method': 'tp',
+                'cost': format_prices(best_revenue)
+            }
+        else:
+            best_revenue = vendor_revenue
+            output_method_dict = {
+                'type': 'sell',
+                'count': output_count,
+                'item': output_item_info['item_id'],
+                'method': 'vendor',
+                'cost': format_prices(best_revenue)
+            }
+
+        recipe_cost = 0
+        recipe_method_dict_list = []
+        for ingredient in ingredient_list:
+            item_query = db.query("SELECT * FROM pricing WHERE item_id = {item_id}".format(item_id=ingredient['item_id'])).as_dict()[0]
+            input_item_count = ingredient['count']
+            best_item_cost = item_query['best_cost']
+            best_total_cost = input_item_count * best_item_cost
+            recipe_cost += best_total_cost
+
+            alternate_recipe_method_dict = {
+                'type': 'buy',
+                'count': input_item_count,
+                'item': item_query['name'],
+                'method': item_query['best_method'],
+                'cost': format_prices(best_total_cost)
+            }
+            recipe_method_dict_list.append(alternate_recipe_method_dict)
+        recipe_method_dict_list.append(output_method_dict)
+
+        alternate_recipe_profit = best_revenue - recipe_cost
+        if alternate_recipe_profit > 0:
+            profit_dict_list.append({'recipe_dict': recipe_dict, 'profit': alternate_recipe_profit, 'method': recipe_method_dict_list})
+
+    if profit_dict_list:
+        profit_dict_list = sorted(profit_dict_list, key=lambda x: x['profit'], reverse=False)
+        profit_dict = profit_dict_list.pop()
+        method_string = ''
+        template = "\n• {type} {count} {item} at {method} for {cost}"
+        for profit_method in profit_dict['method']:
+            method_string += template.format(**profit_method)
+
+        output_dict = {
+            'game_id': profit_dict['recipe_dict']['game_id'],
+            'method': method_string,
+            'profit': format_prices(profit_dict['profit']),
+            'raw_profit': profit_dict['profit'],
+            'raw_method': profit_dict['method']
+        }
+        return output_dict
 
     else:
-        if verbose:
-            print('no profitable version of recipe {game_id}'.format(game_id=recipe_id))
+        return None
 
 
 def format_prices(price):
@@ -537,36 +607,54 @@ def vacuum():
 
 
 if __name__ == '__main__':
-    init_items_flag = False
-    init_recipes_flag = False
-    add_alt_recipes = True
-    
     if init_items_flag:
         init_items()
         populate_items()
         vendor_pricing()
         trading_post_pricing()
+        init_views()
         vacuum()
+        config['db_only']['init_items_flag'] = 'False'
+        with open('config.ini', 'w') as config_file:
+            config.write(config_file)
 
     if init_recipes_flag:
         init_recipes()
-        init_views()
         missed_recipes = populate_recipe_table()
         while missed_recipes:
             missed_recipes = populate_recipe_table(recipe_list=missed_recipes)
             vacuum()
+        config['db_only']['init_recipes_flag'] = 'False'
+        with open('config.ini', 'w') as config_file:
+            config.write(config_file)
 
     if add_alt_recipes:
         added_recipes = True
         while added_recipes:
             vacuum()
             added_recipes = alternate_recipes(debug=True)
+        config['db_only']['add_alternate_recipes'] = 'False'
+        with open('config.ini', 'w') as config_file:
+            config.write(config_file)
 
-    if init_items_flag is False and init_recipes_flag is False and add_alt_recipes:
+    if init_items_flag is False and init_recipes_flag is False and add_alt_recipes is False:
+        # trading_post_pricing()    #todo: activate this when live, disabled now for testing (don't need live prices to see if it's working)
         vacuum()
+
+    item_id_list = api_query(payload='', endpoint='item_details')
+    for item_id in item_id_list:
+        best_recipe_by_component(item_id=item_id)
 
     recipe_list = api_query(payload='', endpoint='recipe_details')
     if verbose:
         print('evaluating profitable recipes')
     for recipe_id in recipe_list:
-        get_price(recipe_id=recipe_id)
+        missed_list = []
+        missed = best_recipe_by_recipe_id(recipe_id=recipe_id)
+        if missed is True:
+            missed_list.append(recipe_id)
+
+    if missed_list != []:
+        populate_recipe_table(recipe_list=missed_list)
+        vacuum()
+
